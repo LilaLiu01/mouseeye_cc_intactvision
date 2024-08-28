@@ -1,0 +1,1140 @@
+---
+title: "CCcontrolAnalysis"
+author: "Sean Liu"
+date: "2023-11-9"
+output:
+  rmdformats::readthedown:
+    self_contained: true
+    code_download: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 3
+    number_sections: true
+    df_print: paged
+    hightlight: tango
+    code_folding: hide
+    fig_width: 10
+    fig_height: 5
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+
+# load packages
+library(data.table)
+library(ggplot2)
+library(ggpubr)
+library(readxl)
+library(reshape2)
+library(dplyr)
+library(rstatix)
+library(Rmisc)
+library(lattice)
+library(plyr)
+library(ggsci)
+library(emmeans)
+library(envalysis)
+library(gridExtra)
+library(ppcor)
+library(psych)
+library(Hmisc)
+library(kableExtra)
+library(corrplot)
+library(ppcor)
+library(patchwork)
+library(gridExtra)
+library(grid)
+library(ggsignif)
+library(writexl)
+library(stringr)
+library(RColorBrewer)
+library(splitstackshape)
+library(lme4)
+library(sjstats)
+library(lsr)
+library(lmerTest)
+library(MuMIn)
+library(reshape)
+library(effects)
+library(BayesFactor)
+library(tidyr)
+library(rstan)
+
+options(digits = 4) 
+options(warn = -1)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+```
+
+# Data exclusion
+
+Load pre-processed data from Pavlovia and do data cleaning in accordance
+with criterion:\
+<!-- (1)Subjects whose error rates exceed mean ± 3 SD of the group -->
+<!-- (2)Subjects whose RT variation exceed mean ± 3 SD of the group -->
+(1)Individual trials with RT shorter than 200ms or exceeding the outlier
+threshold of remaining trials(3SD)\
+(2)Subjects whose with average accuracy lower than 90% are cut off\
+(3)RTs are only analyzed for correct responses\
+(4)Bin 24 blocks in main experiment into 6 epochs to increase
+statistical power\
+
+Experimental design: 16 trials in each block, including 8 repeated
+config + 8 novel config; 25 blocks in total, including 20 training
+blocks + 4 testing blocks + 1 recognition task.
+
+```{r clean data}
+rm(list = ls())
+# read excel sheet with name
+rawdataall <- read_excel("AllData.xlsx", sheet="Exp1RawData")
+setDT(rawdataall)
+
+# remove practice phase
+rawdataall <- rawdataall[phase %in% c("training","testing","rt")]
+
+# set names for presentation
+setnames(rawdataall,"participant","Sub")
+setnames(rawdataall,"CCCondition","Configuration")
+setnames(rawdataall,"key_respMain.corr","Accuracy")
+setnames(rawdataall,"key_respMain.rt","RT")
+setnames(rawdataall,"phase","Phase")
+setnames(rawdataall,"block","Block")
+setnames(rawdataall,"targcell","Cell")
+
+# convert into numeric
+rawdataall$RT = as.numeric(rawdataall$RT)
+rawdataall$Accuracy = as.numeric(rawdataall$Accuracy)
+initial_count <- nrow(rawdataall)
+###########################################################
+# filter3: only accurate responses(get rid of table format)
+tempdata = rawdataall
+tempdata[,filter:=1][Accuracy==0,filter:=0]
+excluded_count_acc <- sum(tempdata$filter == 0)
+cat("Number of excluded trials based on Acc:", excluded_count_acc, "\n")
+###########################################################
+
+
+## filter1: Individual trials remove based on RT
+lowbound <- 0.2
+# function to recursively remove outliers(typically 1 round only)
+remove_RToutliers <- function(data, column_name, threshold_multiplier = 3, max_iterations = 1) {
+  for (iteration in 1:max_iterations) {
+    # Calculate mean and standard deviation
+    mean_val <- mean(data[[column_name]])
+    sd_val <- sd(data[[column_name]])
+    
+    # Set the threshold for outliers
+    lower_threshold <- mean_val - threshold_multiplier * sd_val
+    upper_threshold <- mean_val + threshold_multiplier * sd_val
+    
+    # Remove outliers
+    data <- data %>% filter((data[[column_name]] > lower_threshold) & (data[[column_name]] < upper_threshold))
+  }
+  return(data)
+}
+
+# Remove outliers in RT for main exp but not recognition task -- continue on filter1
+setDT(rawdataall)
+tempdata <- rawdataall %>% filter((RT >= lowbound & Phase %in% c("training", "testing")) | !(Phase %in% c("training", "testing")))
+
+tempdata <- tempdata %>% filter(Phase != "rt")
+tempdata <- tempdata %>%
+  group_by(Sub) %>%
+  group_modify(~ remove_RToutliers(.x, "RT"))
+tempdata <- bind_rows(tempdata, rawdataall %>% filter(Phase == "rt"))
+
+excluded_count_rt <- initial_count - nrow(tempdata)
+cat("Number of excluded trials based on RT:", excluded_count_rt, "\n")
+
+
+# ## filter2: Individual blocks remove based on Acc(90% cutoff)
+# accCutoff_data <- tempdata %>%
+#   filter(Phase %in% c("training", "testing"))
+# 
+# # Calculate mean accuracy
+# sub_means <- accCutoff_data %>%
+#   group_by(Sub, Configuration, Phase) %>%
+#   summarise(mean_accuracy = mean(Accuracy)) %>%
+#   group_by(Sub) %>%
+#   summarise(mean_accuracy = mean(mean_accuracy))
+# 
+# 
+# # Identify 'Sub' with mean accuracy less than 0.9
+# subs_to_block <- sub_means %>%
+#   filter(mean_accuracy < 0.9) %>%
+#   pull(Sub)
+# 
+# # Count and print the number of 'Sub' being ruled out
+# num_subs_ruled_out <- length(subs_to_block)
+# cat(paste("Number of Sub ruled out due to mean accuracy < 0.9 under both training and testing phases:", num_subs_ruled_out, "\n"))
+# 
+# # Filter out the data for the 'Sub' that needs to be blocked
+# cleaned_data <- data %>%
+#   filter(!(Sub %in% subs_to_block))
+
+
+##filter4: See in RT ANOVA
+```
+
+# Accuracy
+
+Check and basically plot: 1.Overall statistics for accuracy 2.two-way
+within-subject ANOVA on acc(If any speed-acc trade-offs with regard to
+configuration)
+
+## Averaged accuracy plotting
+
+```{r bar plot}
+# Plot 1
+# ACC by config
+tempdata <- as.data.table(tempdata)
+accuracylong <- tempdata[, .(Accuracy=mean(Accuracy)),keyby=.(Sub, Configuration, Block, Phase)]
+accuracylong$Sub = as.factor(accuracylong$Sub)
+accuracylong$Configuration = as.factor(accuracylong$Configuration)
+accuracylong$Block <- ifelse(accuracylong$Phase == "testing", accuracylong$Block + 20, accuracylong$Block)
+accuracylong <- accuracylong %>% filter(Phase != "rt")
+
+###################################################
+## filter2: 90% cutoff for each Sub
+mean_accuracy <- accuracylong %>%
+  group_by(Sub) %>%
+  mutate(mean_acc = mean(Accuracy))
+
+Subs_cutoff <- mean_accuracy %>%
+  distinct(Sub, mean_acc) %>%
+  filter(mean_acc < 0.9) %>%
+  pull(Sub)
+
+num_subs_ruled_out <- length(Subs_cutoff)
+cat(paste("Number of excluded subjects based on Accuracy:", num_subs_ruled_out, "\n"))
+###################################################
+
+# Mean and within-subject SE
+dfwc <- summarySEwithin(accuracylong, measurevar="Accuracy", withinvars=c("Configuration"),
+                        idvar="Sub", na.rm=FALSE, conf.interval=.95)
+# bar plot for acc
+b_acc <- dfwc %>%
+  ggplot(aes(x=factor(Configuration,levels=c("novel","repeated")), 
+             y=Accuracy*100, 
+             fill=factor(Configuration,levels=c("novel","repeated")))) +
+  geom_bar(position=position_dodge(.9), fill = c("novel" = "white", "repeated" = "grey"), width=.8, colour="black", stat="identity") +
+  geom_errorbar(position=position_dodge(.9), width=.2, aes(ymin=100*(Accuracy-se), ymax=100*(Accuracy+se))) +
+  coord_cartesian(ylim=c(90,100)) +
+  xlab("Target's Configuration") +
+  ylab("Accuracy (%)") +
+  theme_publish() +
+  theme(legend.position="top",
+        aspect.ratio = 1.5) +
+  scale_fill_grey(start = 0.2, end = 0.6) + 
+  guides(fill=guide_legend(title="Configuration",nrow=1,byrow=TRUE))
+print(b_acc)
+
+
+```
+
+## Accuracy ANOVA
+
+```{r acc ANOVA}
+##filter4: Binned into epochs
+accuracylong <- as.data.table(accuracylong)
+accuracylong[, Block := as.numeric(Block)]
+accuracylong[, Epoch := cut(Block, breaks = c(0, 4, 8, 12, 16, 20, 25),
+                        labels = c(1, 2, 3, 4, 5, 6), include.lowest = FALSE)]
+accuracylong[, Epoch := as.numeric(Epoch)]
+accuracylong$Epoch <- as.factor(accuracylong$Epoch)
+accuracylong <- accuracylong[Epoch %in% c(1, 2, 3, 4, 5)]
+accuracylong <- accuracylong[, .(Accuracy = mean(Accuracy)),
+                     keyby = .(Sub,Configuration)]
+
+# repeated ANOVA: Block * Configuration
+options(contrasts=c('contr.sum','contr.poly'))
+res.aov <- anova_test(
+  data = accuracylong,
+  dv = Accuracy,
+  wid = Sub,
+  within = Configuration,
+  type = 3,
+  effect.size = "pes"
+)
+# print ANOVA table
+get_anova_table(res.aov, 
+                correction="none") %>%
+  kbl(caption = "Accuracy: ANOVA on target's configuration") %>%
+  row_spec(0,bold=TRUE) %>%
+  kable_classic(full_width = F, html_font = "Arial",font_size = 16)
+
+accuracy_wide <- accuracylong %>%
+  pivot_wider(names_from = Configuration, values_from = Accuracy)
+t_test_result <- t.test(accuracy_wide$novel, accuracy_wide$repeated, paired = TRUE)
+formatted_t_test_result <- lapply(t_test_result, function(x) if(is.numeric(x)) sprintf("%.3f", x) else x)
+
+# Print the formatted result
+print(t_test_result$statistic)
+cohen_d <- t_test_result$statistic/sqrt(length(unique(accuracylong$Sub[!is.na(accuracylong$Sub)])))
+cat("Cohen's d:", cohen_d, "\n")
+
+
+# Mean and SE
+result <- accuracylong[, .(MeanAccuracy = mean(Accuracy),(
+                           SE = sd(Accuracy) / sqrt(length(accuracylong)/2))), 
+                       by = Configuration]
+
+print(result)
+```
+
+Overall accuracy is high for both configuration across epochs. As
+expected, the repeated ANOVA on accuracies indicates no potential
+speed-accuracy trade-offs regarding configuration type. However, there's
+also no effect of epoch, showing no fatigure effect or practice effect
+over time.
+
+# Search Time
+
+Check and basically plot: 1.Overall statistics for RT by binned epoch
+2.two-way within-subject ANOVA on RT
+
+## Averaged RT plots
+
+```{r RT plot}
+##filter4: Correct trials only
+# RT by Config across blocks(correct only)
+RTlong <- tempdata[filter==1,
+                     .(RT = mean(RT)),
+                     keyby = .(Sub,Phase,Configuration,Block, Accuracy)]
+RTlong$Sub <- as.factor(RTlong$Sub)
+RTlong$Phase <- as.factor(RTlong$Phase)
+RTlong$Configuration <- as.factor(RTlong$Configuration)
+RTlong$Block <- as.factor(RTlong$Block)
+RTlong <- RTlong %>% filter(Phase != "rt")
+
+## Histogram of Epoch 6
+RT_specific_blocks <- RTlong[Phase == "testing"]
+dfwc_testing <- summarySEwithin(RT_specific_blocks, measurevar = "RT", withinvars = c("Configuration", "Block"), idvar = "Sub", na.rm = FALSE, conf.interval = 0.95)
+setDT(dfwc_testing)
+
+# Plot the within-subject SE for each configuration for each Block
+(hist_plot_se_testing <- ggplot(dfwc_testing, aes(x = as.factor(Block), y = RT * 1000, fill = Configuration)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_errorbar(aes(ymin = (RT - se) * 1000, ymax = (RT + se) * 1000), position = position_dodge(width = 0.9), width = 0.25) +
+  scale_fill_manual(values = c("black", "gray")) +  # Set colors manually
+  labs(x = "Block", y = "RT (ms)", title = element_text("Testing Phase", face = "bold")) +
+  scale_y_continuous(breaks = seq(0, 2000, by = 500), limits = c(0, 2000)) +  
+  scale_x_discrete(breaks = unique(dfwc_testing$Block)) +  # Add ticks on x-axis
+  theme_minimal() +
+  theme(
+    legend.position = "bottom", 
+    panel.grid.major = element_blank(),  # Remove major grid lines
+    panel.grid.minor = element_blank(),  # Remove minor grid lines
+    # panel.border = element_rect(color = "black", fill = NA, size = 1),  # Add border lines
+    legend.text = element_text(size = 14),  # legend font size
+    legend.title = element_text(size = 14, face = "bold"),  # legend title
+    axis.text = element_text(size = 14),  # axis text size
+    axis.title = element_text(size = 16),  # axis title size
+    plot.title = element_text(size = 18, hjust = 0.5, face = "bold"),  # plot title size and bold
+    axis.line = element_line(color = "black", size = 0.5),  # Add axis lines
+    axis.ticks = element_line(color = "black"),  # Add ticks on axis
+  ))
+
+# Save the within-subject SE histogram plot for the specific Blocks
+ggsave("Exp1RT_Testing.jpg", hist_plot_se_testing + theme(plot.background = element_rect(fill = "white")))
+
+##########################################
+##filter4: Binned into epochs
+RTlong <- as.data.table(RTlong)
+RTlong[, Block := as.numeric(Block)]
+RTlong$Block <- ifelse(RTlong$Phase == "testing", RTlong$Block + 20, RTlong$Block)
+RTlong$Block <- RTlong$Block - 1
+RTlong[, Epoch := cut(Block, breaks = c(0, 4, 8, 12, 16, 20, 25),
+                        labels = c(1, 2, 3, 4, 5, 6), include.lowest = FALSE)]
+RTlong[, Epoch := as.numeric(Epoch)]
+RTlong$Epoch <- as.factor(RTlong$Epoch)
+
+# within-subject SE
+dfwc <- summarySEwithin(RTlong, measurevar="RT", withinvars=c("Phase","Configuration","Epoch"),
+                        idvar="Sub", na.rm=FALSE, conf.interval=.95)
+setDT(dfwc)
+
+RT_all_exp <- dfwc %>% 
+  ggplot(aes(x=Epoch, y=RT*1000, 
+             colour=factor(Configuration,levels=c("novel","repeated")),
+             group=factor(Configuration,levels=c("novel","repeated")))) +
+  geom_line(size=1) +
+  geom_point(aes(shape=factor(Configuration,levels=c("novel","repeated")),
+                 color=factor(Configuration,levels=c("novel","repeated"))),size=2.5) + 
+  scale_y_continuous(breaks = seq(1300, 3400, by=300), limits=c(1300, 3400)) +
+  geom_errorbar(width=.3, aes(ymin=(RT-se)*1000, ymax=(RT+se)*1000)) +
+  xlab("Epoch") +
+  ylab("RT (ms)") +
+  scale_color_grey(start = 0.2, end = 0.6) +
+  theme_publish() +
+  geom_vline(xintercept = 5.4, linetype="dotted") +
+  annotate("text", x=3, y=3300, label= "training", size=15/.pt) + 
+  annotate("text", x=6, y=3300, label= "testing", size=15/.pt) +
+  labs(color = "Configuration", shape = "Configuration")+
+  labs(title = "Exp 1") +
+  theme(legend.position="top",
+        aspect.ratio = 0.8)+
+  theme(legend.text = element_text(size = 14), # legend font size
+        legend.title=element_text(size=14), # legend title
+        axis.text = element_text(size = 14), # axis text size
+        axis.title = element_text(size = 16), # axis title size
+        plot.title = element_text(size = 18,hjust = 0.5), # plot title size
+  ) 
+
+
+plot <- ggarrange(RT_all_exp, nrow=1,common.legend = TRUE,legend="bottom")
+annotate_figure(plot, top = text_grob("",
+                                      color = "black", face = "bold", size = 16))
+ggsave("Exp1RT.png", plot + theme_minimal() + theme(plot.background = element_rect(fill = "white")))
+
+```
+
+## RT ANOVA
+
+### Configuration \* Epoch
+
+Experimental blocks are aggregated to 6 epochs, each containing 4
+blocks.
+
+```{r RT ANOVA by epoch}
+# RT by Config across blocks(correct only)
+tempdata <- as.data.table(tempdata)
+write.csv(tempdata, file = "RT_exp1.csv")
+RTexp <- tempdata[filter==1,
+                     .(RT = mean(RT)),
+                     keyby = .(Sub,Phase,Configuration,Block)]
+RTexp$Sub <- as.factor(RTexp$Sub)
+RTexp$Phase <- as.factor(RTexp$Phase)
+RTexp$Configuration <- as.factor(RTexp$Configuration)
+RTexp$Block <- ifelse(RTexp$Phase == "testing", RTexp$Block + 20, RTexp$Block)
+RTexp <- RTexp %>% filter(Phase != "rt")
+RTexp$Block <- as.factor(RTexp$Block)
+
+##filter4: Binned into epochs
+RTexp <- as.data.table(RTexp)
+RTexp[, Block := as.numeric(Block)]
+RTexp[, Epoch := cut(Block, breaks = c(0, 4, 8, 12, 16, 20, 25),
+                        labels = c(1, 2, 3, 4, 5, 6), include.lowest = FALSE)]
+RTexp[, Epoch := as.numeric(Epoch)]
+RTexp$Epoch <- as.factor(RTexp$Epoch)
+RTexp <- RTexp[, .(RT = mean(RT)),
+                     keyby = .(Sub,Configuration,Epoch)]
+write.csv(RTexp, file = "Exp1AData.csv")
+
+
+# repeated ANOVA for RT for main experiment
+options(contrasts=c('contr.sum','contr.poly'))
+res.aov <- anova_test(
+  data = RTexp,
+  dv = RT,
+  wid = Sub,
+  within = c(Configuration,Epoch),
+  type = 3,
+  effect.size = "pes"
+)
+
+# simple effect test
+model <- aov(RT ~ Configuration * Epoch + Error(Sub), data = RTexp)
+emm <- emmeans(model, ~ Configuration | Epoch)
+comparisons <- pairs(emm)
+print(comparisons)
+
+# print ANOVA table for main experiment
+options(digits=4)
+get_anova_table(res.aov, 
+                correction="none") %>%
+  kbl(caption = "RT: ANOVA on target's configuration * epoch") %>%
+  row_spec(0,bold=TRUE) %>%
+  kable_classic(full_width = F, html_font = "Arial",font_size = 16)
+
+
+```
+
+
+
+### ANOVA for Training Phase Only
+```{r RT ANOVA by subset epoch}
+# Filter data for epochs 1 to 5
+RTexp_subset <- RTexp[Epoch %in% c(1, 2, 3, 4, 5)]
+
+# Repeated ANOVA for RT for epochs 1 to 5
+res.aov_subset <- anova_test(
+  data = RTexp_subset,
+  dv = RT,
+  wid = Sub,
+  within = c(Configuration, Epoch),
+  type = 3,
+  effect.size = "pes"
+)
+
+# Simple effect test for epochs 1 to 5
+model_subset <- aov(RT ~ Configuration * Epoch + Error(Sub), data = RTexp_subset)
+emm_subset <- emmeans(model_subset, ~ Configuration | Epoch)
+comparisons_subset <- pairs(emm_subset)
+print(comparisons_subset)
+
+# Print ANOVA table for epochs 1 to 5
+options(digits=4)
+get_anova_table(res.aov_subset, 
+                
+                correction = "none") %>%
+  kbl(caption = "RT: ANOVA on target's configuration * epoch (Epochs 1-5)") %>%
+  row_spec(0, bold = TRUE) %>%
+  kable_classic(full_width = F, html_font = "Arial", font_size = 16)
+```
+
+
+
+### ANOVA for 5th Epoch
+```{r ANOVA final training phase}
+# Filter data for the 5th epoch
+RTexp_epoch5 <- RTexp[Epoch == 5]
+
+# ANOVA for RT for the 6th epoch (main effect of Configuration)
+model_epoch5 <- anova_test(
+  data = RTexp_epoch5,
+  dv = RT,
+  wid = Sub,
+  within = Configuration,
+  type = 3,
+  effect.size = "pes"
+)
+
+
+# Cohen's d
+repeated_5 <- RTexp_epoch5$RT[RTexp_epoch5$Configuration == "repeated"]
+novel_5 <- RTexp_epoch5$RT[RTexp_epoch5$Configuration == "novel"]
+cat("RT saving (s):", mean(novel_5) - mean(repeated_5), "\n")
+cat("saving percentage:", (mean(novel_5) - mean(repeated_5))/mean(novel_5), "\n")
+
+
+# Print ANOVA table for the 5th epoch with PES
+options(digits=4)
+get_anova_table(model_epoch5, 
+                correction = "none") %>%
+  kbl(caption = "RT: ANOVA on target's configuration (Epoch 5)") %>%
+  row_spec(0, bold = TRUE) %>%
+  kable_classic(full_width = F, html_font = "Arial", font_size = 16)
+
+
+RTepoch5_wide <- RTexp_epoch5 %>%
+  pivot_wider(names_from = Configuration, values_from = RT)
+t_test_result <- t.test(RTepoch5_wide$novel, RTepoch5_wide$repeated, paired = TRUE)
+formatted_t_test_result <- lapply(t_test_result, function(x) if(is.numeric(x)) sprintf("%.3f", x) else x)
+
+# Print the formatted result
+print(formatted_t_test_result$statistic)
+cohen_d <- as.numeric(formatted_t_test_result$statistic)/sqrt(length(unique(RTexp_epoch5$Sub[!is.na(RTexp_epoch5$Sub)])))
+cat("Cohen's d:", cohen_d, "\n")
+```
+
+
+## ANOVA for Testing Phase
+```{r ANOVA raw test phase}
+# Filter data for the 6th epoch
+RTexp_epoch6 <- RTexp[Epoch == 6]
+
+# ANOVA for RT for the 6th epoch (main effect of Configuration)
+model_epoch6 <- anova_test(
+  data = RTexp_epoch6,
+  dv = RT,
+  wid = Sub,
+  within = Configuration,
+  type = 3,
+  effect.size = "pes"
+)
+
+
+# Cohen's d
+repeated_6 <- RTexp_epoch6$RT[RTexp_epoch6$Configuration == "repeated"]
+novel_6 <- RTexp_epoch6$RT[RTexp_epoch6$Configuration == "novel"]
+cat("RT saving:", mean(novel_6) - mean(repeated_6), "\n")
+cat("saving percentage:", (mean(novel_6) - mean(repeated_6))/mean(novel_6), "\n")
+
+
+# Print ANOVA table for the 5th epoch with PES
+options(digits=4)
+get_anova_table(model_epoch6, 
+                correction = "none") %>%
+  kbl(caption = "RT: ANOVA on target's configuration (Epoch 6)") %>%
+  row_spec(0, bold = TRUE) %>%
+  kable_classic(full_width = F, html_font = "Arial", font_size = 16)
+
+
+RTepoch6_wide <- RTexp_epoch6 %>%
+  pivot_wider(names_from = Configuration, values_from = RT)
+t_test_result <- t.test(RTepoch6_wide$novel, RTepoch6_wide$repeated, paired = TRUE)
+formatted_t_test_result <- lapply(t_test_result, function(x) if(is.numeric(x)) sprintf("%.3f", x) else x)
+
+# Print the formatted result
+print(t_test_result$statistic)
+
+cohen_d <- as.numeric(t_test_result$statistic)/sqrt(length(unique(RTexp_epoch6$Sub[!is.na(RTexp_epoch6$Sub)])))
+cat("Cohen's d:", cohen_d, "\n")
+```
+
+
+
+
+Repeated ANOVA with within-subjects factors epoch and configuration on
+RT was done, which yields significant main effect of both epoch and
+configuration. Importantly, the interaction is also significant,
+indicating contextual cueing developing over time.
+
+# Awareness
+
+To study the effect of explicit awareness of scene configuration
+repetition on RT, we convert the forced-choice recognition responses
+into d-prime.
+
+## Accuracy for each subject
+
+```{r awareness check}
+# RT accuracy for each subject
+rtdata <- tempdata %>% filter(Phase == "rt")
+rtdata <- as.data.table(rtdata)
+accuracyAll <- rtdata[, .(Accuracy=mean(Accuracy)),keyby=.(Sub)]
+
+# print table
+accuracyAll %>%
+  kbl(caption = "Accuracy of Recognition Task in each subject") %>%
+  row_spec(0,bold=TRUE) %>%   kable_classic(full_width = F, html_font = "Arial",font_size = 16)
+
+
+# t-test
+options(digits = 4)
+chance_level <- 0.5
+t_test_result <- t.test(accuracyAll$Accuracy, mu = chance_level)
+formatted_t_test_result <- lapply(t_test_result, function(x) if(is.numeric(x)) sprintf("%.3f", x) else x)
+
+# Print the formatted result
+print(t_test_result)
+```
+
+## d-prime for each subject
+
+```{r d-prime calculation}
+rtdata <- rtdata %>%
+  mutate(
+    hit = as.numeric(Accuracy == 1 & key_respMain.keys == "y"),
+    false_alarm = as.numeric(Accuracy == 0 & key_respMain.keys == "y")
+  )
+hitAll <- rtdata[, .(hit=mean(hit)),keyby=.(Sub)]
+faAll <- rtdata[, .(false_alarm=mean(false_alarm)),keyby=.(Sub)]
+dAll <- merge(hitAll, faAll, by = "Sub", all = TRUE)
+
+dAll <- as.data.table(dAll)
+dAll[, dprime := qnorm(hit) - qnorm(false_alarm)]
+dAll[, c("hit", "false_alarm") := NULL]
+
+cat("Mean d':", mean(dAll$dprime), "\n")
+cat("SD':", sd(dAll$dprime), "\n")
+
+
+# print table
+dAll %>%
+  kbl(caption = "d-prime for each subject") %>%
+  row_spec(0,bold=TRUE) %>%   kable_classic(full_width = F, html_font = "Arial",font_size = 16)
+
+
+# t-test
+options(digits = 4)
+guessing <- 0
+d_ttest <- t.test(dAll$dprime, mu = guessing)
+d_ttest$statistic
+d_ttest$p.value
+
+# Bayes Factor
+bf = ttestBF(x = dAll$dprime, mu = 0) 
+extractBF(bf)
+```
+
+d' close to 0 represents chance performance.
+
+## Awareness \* Configuration \* Phase ANOVA on RT saving percentage
+
+```{r 3-way ANOVA on RT saving}
+# Construct RT saving on seeing repeated configurations
+awardata = RTexp
+awardata <- merge(awardata, dAll[, c("Sub", "dprime")], by = "Sub", all.x = TRUE)
+awardata_novel <- awardata%>% filter(Configuration == "novel")
+setDT(awardata_novel)
+setnames(awardata_novel,"RT","RT_novel")
+
+awardata_repeated <- awardata%>% filter(Configuration == "repeated")
+setDT(awardata_repeated)
+setnames(awardata_repeated,"RT","RT_repeated")
+
+awardata_saving <- awardata_novel %>%
+  inner_join(awardata_repeated, by = c("Sub", "Epoch", "dprime")) %>%
+  mutate(RT_saving = (RT_novel - RT_repeated)/(0.5*(RT_novel + RT_repeated))) %>%
+  dplyr::select(-starts_with("Configuration"), -RT_novel, -RT_repeated)
+
+awardata_saving$Epoch <- as.numeric(awardata_saving$Epoch)
+
+# Fit a mixed-effects model
+awarmodel <- lmer(RT_saving ~ Epoch * dprime + (1 | Sub), data = awardata_saving, REML=F)
+summary(awarmodel)
+# Visualize the interaction
+(plot <- ggplot(awardata_saving, aes(x = dprime, y = RT_saving, color = as.factor(Epoch))) +
+  geom_point(alpha = 0.8) +
+  geom_smooth(method = "lm", alpha = 0.1) +
+  labs(x = "d'", y = "RT Saving (%)", color = "Epoch") +
+  theme_minimal() +
+  theme(legend.text = element_text(size = 14), # legend font size
+        legend.title=element_text(size=14, face = "bold"), # legend title
+        axis.text = element_text(size = 10), # axis text size
+        axis.title = element_text(size = 16), # axis title size
+  ) )
+
+ggsave("Exp1Slopes.png", plot + theme(plot.background = element_rect(fill = "white")))
+```
+
+As the results shown, there's no interaction between epoch and awareness
+of configuration repetition.
+
+## Correlation between RT saving in 5th Epoch and d'
+
+```{r last training epoch correlation}
+
+# Calculate correlation coefficients for each Block
+# correlations <- bind_rows(correlations)
+awardata_epoch5 <- awardata_saving[Epoch == 5]
+correlations <- cor.test(awardata_epoch5$RT_saving, awardata_epoch5$dprime, method = "pearson", use = "pairwise.complete.obs")
+p_value <- correlations$p.value
+cat("p = ", p_value, "\n")
+
+# print table
+correlations <- awardata_epoch5 %>%
+  # group_by(Block) %>%
+  do(correlation = cor(.$RT_saving, .$dprime, use = "pairwise.complete.obs"))
+
+correlations %>%
+  kbl(caption = "r between RT savings and d for last epoch in training phase'") %>%
+  row_spec(0,bold=TRUE) %>%   kable_classic(full_width = F, html_font = "Arial",font_size = 16)
+```
+
+## Correlation between RT saving in testing phase and d'
+```{r testing correlation}
+# Calculate correlation coefficients for each Block
+# correlations <- bind_rows(correlations)
+awardata_epoch5 <- awardata_saving[Epoch == 6]
+correlations <- cor.test(awardata_epoch5$RT_saving, awardata_epoch5$dprime, method = "pearson", use = "pairwise.complete.obs")
+p_value <- correlations$p.value
+cat("p = ", p_value, "\n")
+
+# print table
+correlations <- awardata_epoch5 %>%
+  # group_by(Block) %>%
+  do(correlation = cor(.$RT_saving, .$dprime, use = "pairwise.complete.obs"))
+
+correlations %>%
+  kbl(caption = "r between RT savings and d for testing phase'") %>%
+  row_spec(0,bold=TRUE) %>%   kable_classic(full_width = F, html_font = "Arial",font_size = 16)
+```
+
+
+## Awareness(binned) \* Configuration \* Phase ANOVA
+
+Categorize subjects whose d-prime \> 0 as aware-group, and the other as
+unaware-group.
+
+```{r binned awareness}
+# Convert dprime to yes/no
+awardata_binned = RTexp
+awardata_binned <- merge(awardata_binned, dAll[, c("Sub", "dprime")], by = "Sub", all.x = TRUE)
+awardata_binned$Awareness <- ifelse(awardata_binned$dprime > 0, 1, 0)
+
+bxp <- ggboxplot(
+  awardata_binned, x = "Awareness", y = "RT",
+  color = "Epoch", palette = "jco",
+  facet.by = "Configuration", short.panel.labs = FALSE
+  )
+bxp
+
+res.aov <- anova_test(
+  data = awardata_binned, dv = RT, wid = Sub,
+  between = Awareness, within = c(Configuration, Epoch)
+  )
+get_anova_table(res.aov)
+```
+
+No effect related to awareness is significant.
+
+## Awareness(binned) \* Phase ANOVA on RT saving
+
+```{r binned awareness on RT_saving}
+# Convert dprime to yes/no
+awardata_binned = RTexp
+awardata_binned <- merge(awardata_binned, dAll[, c("Sub", "dprime")], by = "Sub", all.x = TRUE)
+awardata_binned$Awareness <- ifelse(awardata_binned$dprime > 0, 1, 0)
+
+awardata_novel <- awardata_binned%>% filter(Configuration == "novel")
+setDT(awardata_novel)
+setnames(awardata_novel,"RT","RT_novel")
+
+awardata_repeated <- awardata_binned%>% filter(Configuration == "repeated")
+setDT(awardata_repeated)
+setnames(awardata_repeated,"RT","RT_repeated")
+
+awardata_saving_binned <- awardata_novel %>%
+  inner_join(awardata_repeated, by = c("Sub", "Epoch", "Awareness")) %>%
+  mutate(RT_saving = RT_novel - RT_repeated) %>%
+  dplyr::select(-starts_with("Configuration"), -RT_novel, -RT_repeated)
+
+
+
+bxp <- ggboxplot(
+  awardata_binned, x = "Awareness", y = "RT",
+  color = "Epoch", palette = "jco",
+  short.panel.labs = FALSE
+  )
+bxp
+
+res.aov <- anova_test(
+  data = awardata_saving_binned, dv = RT_saving, wid = Sub,
+  between = Awareness, within = c(Epoch)
+  )
+get_anova_table(res.aov)
+```
+
+No effect related to awareness on RT saving is significant.
+
+# Z-score Search Time
+
+## Averaged Z-scored RT plots
+
+```{r z-scored}
+# Construct new data(tempdata changed)
+tempdata[, RT:=scale(RT), by=Sub]
+RTnorm <- tempdata[filter==1,
+                     .(RT = mean(RT)),
+                     keyby = .(Sub,Phase,Configuration,Block, Accuracy)]
+RTnorm$Sub <- as.factor(RTnorm$Sub)
+RTnorm$Phase <- as.factor(RTnorm$Phase)
+RTnorm$Configuration <- as.factor(RTnorm$Configuration)
+RTnorm$Block <- as.factor(RTnorm$Block)
+RTnorm <- RTnorm %>% filter(Phase != "rt")
+
+##filter4: Binned into epochs
+RTnorm <- as.data.table(RTnorm)
+RTnorm[, Block := as.numeric(Block)]
+RTnorm$Block <- ifelse(RTnorm$Phase == "testing", RTnorm$Block + 20, RTnorm$Block)
+RTnorm$Block <- RTnorm$Block - 1
+RTnorm[, Epoch := cut(Block, breaks = c(0, 4, 8, 12, 16, 20, 25),
+                      labels = c(1, 2, 3, 4, 5, 6), include.lowest = FALSE)]
+RTnorm[, Epoch := as.numeric(Epoch)]
+RTnorm$Epoch <- as.factor(RTnorm$Epoch)
+
+# within-subject SE
+dfwc <- summarySEwithin(RTnorm, measurevar="RT", withinvars=c("Phase","Configuration","Epoch"),
+                        idvar="Sub", na.rm=FALSE, conf.interval=.95)
+setDT(dfwc)
+
+RT_norm_exp <- dfwc %>% 
+  ggplot(aes(x=Epoch, y=RT, 
+             colour=factor(Configuration,levels=c("novel","repeated")),
+             group=factor(Configuration,levels=c("novel","repeated")))) +
+  geom_line(size=1) +
+  geom_point(aes(shape=factor(Configuration,levels=c("novel","repeated")),
+                 color=factor(Configuration,levels=c("novel","repeated"))),size=2.5) + 
+  scale_y_continuous(breaks = seq(-1, 1, by=0.25), limits=c(-1, 1)) +
+  geom_errorbar(width=.3, aes(ymin=(RT-se), ymax=(RT+se))) +
+  xlab("Epoch") +
+  ylab("Z-Scored RT") +
+  scale_color_grey(start = 0.2, end = 0.6) +
+  theme_publish() +
+  geom_vline(xintercept = 5.4, linetype="dotted") +
+  annotate("text", x=3, y=0.75, label= "training", size=15/.pt) + 
+  annotate("text", x=6, y=0.75, label= "testing", size=15/.pt) +
+  labs(color = "Configuration", shape = "Configuration")+
+  labs(title = "Exp 1") +
+  theme(legend.position="top",
+        aspect.ratio = 0.8)+
+  theme(legend.text = element_text(size = 14), # legend font size
+        legend.title=element_text(size=14), # legend title
+        axis.text = element_text(size = 14), # axis text size
+        axis.title = element_text(size = 16), # axis title size
+        plot.title = element_text(size = 18,hjust = 0.5), # plot title size
+        # axis.text.x = element_text(angle = 45, hjust = 1) # Rotate the block num to avoid overlap
+  ) 
+
+plot <- ggarrange(RT_norm_exp, nrow=1,common.legend = TRUE,legend="bottom")
+annotate_figure(plot, top = text_grob("",
+                                      color = "black", face = "bold", size = 16))
+
+ggsave("Exp1RTStandard.png", plot + theme_minimal() + theme(plot.background = element_rect(fill = "white")))
+```
+
+## Z-scored RT ANOVA
+
+```{r RT ANOVA by epoch Z-RT}
+# RT by Config across blocks(correct only)
+tempdata <- as.data.table(tempdata)
+write.csv(tempdata, file = "RTnorm_exp1.csv")
+RTexp <- tempdata[filter==1,
+                     .(RT = mean(RT)),
+                     keyby = .(Sub,Phase,Configuration,Block)]
+RTexp$Sub <- as.factor(RTexp$Sub)
+RTexp$Phase <- as.factor(RTexp$Phase)
+RTexp$Configuration <- as.factor(RTexp$Configuration)
+RTexp$Block <- ifelse(RTexp$Phase == "testing", RTexp$Block + 20, RTexp$Block)
+RTexp <- RTexp %>% filter(Phase != "rt")
+RTexp$Block <- as.factor(RTexp$Block)
+
+##filter4: Binned into epochs
+RTexp <- as.data.table(RTexp)
+RTexp[, Block := as.numeric(Block)]
+RTexp[, Epoch := cut(Block, breaks = c(0, 4, 8, 12, 16, 20, 25),
+                        labels = c(1, 2, 3, 4, 5, 6), include.lowest = FALSE)]
+RTexp[, Epoch := as.numeric(Epoch)]
+RTexp$Epoch <- as.factor(RTexp$Epoch)
+RTexp <- RTexp[, .(RT = mean(RT)),
+                     keyby = .(Sub,Configuration,Epoch)]
+write.csv(RTexp, file = "Exp1AZscoreData.csv")
+
+# repeated ANOVA for RT for main experiment
+options(contrasts=c('contr.sum','contr.poly'))
+res.aov <- anova_test(
+  data = RTexp,
+  dv = RT,
+  wid = Sub,
+  within = c(Configuration,Epoch),
+  type = 3,
+  effect.size = "pes"
+)
+
+# simple effect test
+model <- aov(RT ~ Configuration * Epoch + Error(Sub), data = RTexp)
+emm <- emmeans(model, ~ Configuration | Epoch)
+comparisons <- pairs(emm)
+print(comparisons)
+
+# print ANOVA table for main experiment
+get_anova_table(res.aov, 
+                correction="none") %>%
+  kbl(caption = "RT: ANOVA on target's configuration * epoch") %>%
+  row_spec(0,bold=TRUE) %>%
+  kable_classic(full_width = F, html_font = "Arial",font_size = 16)
+```
+
+
+### Z-scored ANOVA for Training Phase Only
+```{r RT ANOVA by subset epoch}
+# Filter data for epochs 1 to 5
+RTexp_subset <- RTexp[Epoch %in% c(1, 2, 3, 4, 5)]
+
+# Repeated ANOVA for RT for epochs 1 to 5
+res.aov_subset <- anova_test(
+  data = RTexp_subset,
+  dv = RT,
+  wid = Sub,
+  within = c(Configuration, Epoch),
+  type = 3,
+  effect.size = "pes"
+)
+
+# Simple effect test for epochs 1 to 5
+model_subset <- aov(RT ~ Configuration * Epoch + Error(Sub), data = RTexp_subset)
+emm_subset <- emmeans(model_subset, ~ Configuration | Epoch)
+comparisons_subset <- pairs(emm_subset)
+print(comparisons_subset)
+
+# Print ANOVA table for epochs 1 to 5
+options(digits=4)
+get_anova_table(res.aov_subset, 
+                
+                correction = "none") %>%
+  kbl(caption = "RT: ANOVA on target's configuration * epoch (Epochs 1-5)") %>%
+  row_spec(0, bold = TRUE) %>%
+  kable_classic(full_width = F, html_font = "Arial", font_size = 16)
+```
+### ANOVA for 5th Epoch
+```{r ANOVA epoch 5 Z-scored}
+# Filter data for the 6th epoch
+RTexp_epoch5 <- RTexp[Epoch == 5]
+
+# ANOVA for RT for the 6th epoch (main effect of Configuration)
+model_epoch5 <- anova_test(
+  data = RTexp_epoch5,
+  dv = RT,
+  wid = Sub,
+  within = Configuration,
+  type = 3,
+  effect.size = "pes"
+)
+
+
+# Cohen's d
+repeated_5 <- RTexp_epoch5$RT[RTexp_epoch5$Configuration == "repeated"]
+novel_5 <- RTexp_epoch5$RT[RTexp_epoch5$Configuration == "novel"]
+cat("RT saving (units):", mean(novel_5) - mean(repeated_5), "\n")
+
+# Print ANOVA table for the 5th epoch with PES
+options(digits=4)
+get_anova_table(model_epoch5, 
+                correction = "none") %>%
+  kbl(caption = "RT: ANOVA on target's configuration (Epoch 5)") %>%
+  row_spec(0, bold = TRUE) %>%
+  kable_classic(full_width = F, html_font = "Arial", font_size = 16)
+
+t_test_result <- t.test(RT ~ Configuration, data = RTexp_epoch5, paired = TRUE)
+formatted_t_test_result <- lapply(t_test_result, function(x) if(is.numeric(x)) sprintf("%.3f", x) else x)
+
+# Print the formatted result
+print(t_test_result$statistic)
+
+cohen_d <- t_test_result$statistic/sqrt(length(unique(RTexp_epoch5$Sub[!is.na(RTexp_epoch5$Sub)])))
+cat("Cohen's d:", cohen_d, "\n")
+```
+
+
+## ANOVA for Transfer Phase
+```{r ANOVA transfer phase}
+# Filter data for the 6th epoch
+RTexp_epoch6 <- RTexp[Epoch == 6]
+
+# ANOVA for RT for the 6th epoch (main effect of Configuration)
+model_epoch6 <- anova_test(
+  data = RTexp_epoch6,
+  dv = RT,
+  wid = Sub,
+  within = Configuration,
+  type = 3,
+  effect.size = "pes"
+)
+
+
+# Cohen's d
+repeated_6 <- RTexp_epoch6$RT[RTexp_epoch6$Configuration == "repeated"]
+novel_6 <- RTexp_epoch6$RT[RTexp_epoch6$Configuration == "novel"]
+cat("RT saving (units):", mean(novel_6) - mean(repeated_6), "\n")
+
+# Print ANOVA table for the 6th epoch with PES
+options(digits=4)
+get_anova_table(model_epoch6, 
+                correction = "none") %>%
+  kbl(caption = "RT: ANOVA on target's configuration (Epoch 6)") %>%
+  row_spec(0, bold = TRUE) %>%
+  kable_classic(full_width = F, html_font = "Arial", font_size = 16)
+
+t_test_result <- t.test(RT ~ Configuration, data = RTexp_epoch6, paired = TRUE)
+formatted_t_test_result <- lapply(t_test_result, function(x) if(is.numeric(x)) sprintf("%.3f", x) else x)
+
+# Print the formatted result
+print(t_test_result$statistic)
+
+cohen_d <- t_test_result$statistic/sqrt(length(unique(RTexp_epoch6$Sub[!is.na(RTexp_epoch6$Sub)])))
+cat("Cohen's d:", cohen_d, "\n")
+```
+
+# Individual difference
+For repeated configuration, we check individual difference in awareness and its impact on RT in testing phase. Specifically, We examined the RT of identified and unidentified repeated configurations separately.
+
+```{r by sub Exp2}
+##########################################
+# read csv sheet with name
+RTlong_exp1 <- read.csv("RT_exp1.csv")
+RTnorm_exp1 <- read.csv("RTnorm_exp1.csv")
+
+
+RTlong_exp1 <- RTlong_exp1 %>%
+  mutate(Condition = "control")
+RTnorm_exp1 <- RTnorm_exp1 %>%
+  mutate(Condition = "control")
+
+# merge data
+RTlong <- RTlong_exp1
+RTnorm <- RTnorm_exp1
+##########################################
+
+## Exp1
+filtered_data <- RTlong_exp1 %>%
+  filter(Phase == "rt" & Configuration == "repeated")
+
+# Store the aware and unaware config for each Sub
+filtered_data <- as.data.table(filtered_data)
+filtered_data$configurationNumber = as.numeric(filtered_data$configurationNumber)
+
+aware_data <- filtered_data %>%
+  filter(Accuracy == 1) %>%
+  dplyr::select(Sub, configurationNumber)
+
+unaware_data <- filtered_data %>%
+  filter(Accuracy == 0) %>%
+  dplyr::select(Sub, configurationNumber)
+  
+# Group the data in testing phase
+RT_testing <- RTlong %>%
+  filter(Phase == "testing")
+
+RT_aware <- RT_testing %>%
+  semi_join(aware_data, by = c("Sub", "configurationNumber"))
+
+RT_unaware <- RT_testing %>%
+  semi_join(unaware_data, by = c("Sub", "configurationNumber"))
+
+# Merge data based on recognition task
+RT_aware <- RT_aware %>%
+  mutate(recog = 1)
+RT_unaware <- RT_unaware %>%
+  mutate(recog = 0)
+RT_indi <- rbind(RT_aware, RT_unaware)
+
+# Plot RT saving from awareness
+Sub_diff <- RT_indi %>%
+  filter(filter == 1) 
+RT_aware <- as.data.table(RT_aware)
+RT_unaware <- as.data.table(RT_unaware)
+
+RT_aware <- RT_aware[filter == 1, .(RTaware=mean(RT)),keyby=.(Sub)]
+RT_unaware <- RT_unaware[filter == 1, .(RTunaware=mean(RT)),keyby=.(Sub)]
+RTall <- merge(RT_aware, RT_unaware, by = "Sub", all = TRUE)
+RTall <- RTall[!is.na(RTaware) & !is.na(RTunaware)]
+RTall[, RTcc := RTunaware - RTaware]
+
+# Creating a scatter plot
+(plot <- ggplot(RTall, aes(x = Sub, y = RTcc, color = RTcc)) +
+  geom_point(size = 3) +
+  scale_color_gradient(low = "blue", high = "red", name = "RT saving") +
+  labs(x = "Individuals", y = "RT Saving from Recognition (s)", title = "Individual Differences in Transfer Phase") +
+  theme(
+    legend.text = element_text(size = 14),  # legend font size and bold
+    legend.title = element_text(size = 14, face = "bold"),  # legend title and bold
+    axis.text = element_text(size = 10),  # axis text size
+    axis.title = element_text(size = 16),  # axis title size
+    axis.text.x = element_blank(),  # hide x-axis labels
+    plot.title = element_text(size = 18,hjust = 0.5, face = "bold"),
+  ))
+
+       
+ggsave("Exp1Indi.png", plot + theme(plot.background = element_rect(fill = "white")))       
+
+# ANOVA on RT saving
+RT_indi <- as.data.table(RT_indi)
+setnames(RT_indi,"recog","Recognition")
+RT_indi$Recognition <- as.factor(RT_indi$Recognition)
+RT_indi$Sub <- as.factor(RT_indi$Sub)
+RT_indi <- RT_indi[, .(RT = mean(RT)),
+                     keyby = .(Sub,Recognition)]
+
+options(contrasts=c('contr.sum','contr.poly'))
+res.aov <- anova_test(
+data = RT_indi,
+dv = RT,
+wid = Sub,
+within = Recognition,
+type = 3,
+effect.size = "pes"
+)
+
+# print ANOVA table for testing
+get_anova_table(res.aov, 
+                correction="none") %>%
+  kbl(caption = "RT: ANOVA on recognition of repeated configuration") %>%
+  row_spec(0,bold=TRUE) %>%
+  kable_classic(full_width = F, html_font = "Arial",font_size = 16)
+```
