@@ -2,7 +2,7 @@
 Instructions for Running the pipeline:
 ---------------------------------------------------------------
 
-![Demo of the Task]([https://your-link-to-the-gif.com/demo.gif](https://drive.google.com/file/d/1LFHKS2tdIHiz_vBlDx_lep6iS4B-pkRs/view?usp=sharing))
+![Demo of the Task](https://drive.google.com/file/d/1LFHKS2tdIHiz_vBlDx_lep6iS4B-pkRs/view?usp=sharing)
 
 
 1. Qualtrics for recruitment:
